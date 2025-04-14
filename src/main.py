@@ -19,6 +19,7 @@ from src.extract import (
     get_table_columns,
     get_table_primary_keys,
     extract_table_data,
+    extract_table_data_in_batches,
 )
 from src.transform import (
     transform_dataframe,
@@ -214,31 +215,83 @@ class ETLPipeline:
                 self.batch_size
             )
             
-            if df.empty and source_row_count > 0:
-                error_msg = f"Failed to extract data from table '{source_schema}.{table}'"
-                logger.error(error_msg)
-                table_stats["errors"].append(error_msg)
-                self.failed_tables.add(table_key)
-                return table_stats
-            
             # Update source row count
             table_stats["source_rows"] = source_row_count
             
-            if not df.empty:
+            if df.empty and source_row_count > 0:
+                # This indicates a large table that needs batch processing
+                logger.info(f"Table '{source_schema}.{table}' has {source_row_count} rows. Using batch processing.")
+                
+                # Process table in batches
+                batch_insert_success = self.process_table_in_batches(
+                    source_conn,
+                    target_conn,
+                    source_schema,
+                    target_schema,
+                    table,
+                    table_stats
+                )
+                
+                if not batch_insert_success:
+                    error_msg = f"Failed to process large table '{source_schema}.{table}' in batches"
+                    logger.error(error_msg)
+                    table_stats["errors"].append(error_msg)
+                    
+                    # Mark table as failed
+                    table_stats["success"] = False
+                    
+                    # Check if we should retry
+                    if retry_count < self.max_retries:
+                        logger.warning(f"Will retry table '{table_key}' later (attempt {retry_count + 1})")
+                        return table_stats
+                    
+                    self.failed_tables.add(table_key)
+                    return table_stats
+                else:
+                    # Batch processing was successful
+                    table_stats["success"] = True
+                    logger.info(f"Successfully processed '{source_schema}.{table}' with {table_stats['target_rows']} rows transferred ({table_stats.get('completion_percentage', 0):.2f}%)")
+            elif not df.empty:
                 # Transform data
                 df_transformed = transform_dataframe(df, columns)
                 
                 # Force python native types to avoid np.float64 issues
                 for col in df_transformed.columns:
                     if df_transformed[col].dtype.name.startswith('float'):
-                        df_transformed[col] = df_transformed[col].astype(float)
+                        # Explicitly convert numpy float types to Python float
+                        non_null = ~df_transformed[col].isna()
+                        df_transformed.loc[non_null, col] = df_transformed.loc[non_null, col].apply(
+                            lambda x: float(x) if pd.notnull(x) else None
+                        )
                     elif df_transformed[col].dtype.name.startswith('int'):
                         # Convert integers to float if they might be too large
                         # This prevents integer overflow errors
                         if df_transformed[col].max() > 2147483647 or df_transformed[col].min() < -2147483648:
                             df_transformed[col] = df_transformed[col].astype(float)
                         else:
-                            df_transformed[col] = df_transformed[col].astype(int)
+                            # Explicitly convert to Python int
+                            non_null = ~df_transformed[col].isna()
+                            df_transformed.loc[non_null, col] = df_transformed.loc[non_null, col].apply(
+                                lambda x: int(x) if pd.notnull(x) else None
+                            )
+                    elif 'datetime' in df_transformed[col].dtype.name or df_transformed[col].dtype.name.startswith('datetime'):
+                        # Ensure datetime types are properly converted
+                        non_null = ~df_transformed[col].isna()
+                        df_transformed.loc[non_null, col] = df_transformed.loc[non_null, col].apply(
+                            lambda x: x.to_pydatetime() if hasattr(x, 'to_pydatetime') else x
+                        )
+                    elif df_transformed[col].dtype.name.startswith('bool'):
+                        # Explicitly convert to Python bool
+                        non_null = ~df_transformed[col].isna()
+                        df_transformed.loc[non_null, col] = df_transformed.loc[non_null, col].apply(
+                            lambda x: bool(x) if pd.notnull(x) else None
+                        )
+                    elif hasattr(df_transformed[col].dtype, 'type'):
+                        # Handle other numpy types by converting them to Python native types
+                        non_null = ~df_transformed[col].isna()
+                        df_transformed.loc[non_null, col] = df_transformed.loc[non_null, col].apply(
+                            lambda x: x.item() if hasattr(x, 'item') else x
+                        )
                 
                 # Validate data types
                 validation_issues = validate_data_types(df_transformed, columns)
@@ -323,6 +376,181 @@ class ETLPipeline:
             table_stats["duration"] = (end_time - start_time).total_seconds()
             
             return table_stats
+    
+    def process_table_in_batches(self, source_conn, target_conn, source_schema, target_schema, table, table_stats):
+        """
+        Process a large table in batches to avoid memory issues.
+        
+        Args:
+            source_conn: Database connection to source
+            target_conn: Database connection to target
+            source_schema: str - Source schema name
+            target_schema: str - Target schema name
+            table: str - Table name
+            table_stats: dict - Current table statistics to update
+            
+        Returns:
+            bool: Success status
+        """
+        try:
+            logger.info(f"Processing large table in batches: {source_schema}.{table}")
+            
+            # Get table columns from source (needed for transformation)
+            columns = get_table_columns(source_conn, source_schema, table)
+            
+            if not columns:
+                error_msg = f"No columns found for table '{source_schema}.{table}'"
+                logger.error(error_msg)
+                table_stats["errors"].append(error_msg)
+                return False
+            
+            # Get batches iterator
+            try:
+                batches = extract_table_data_in_batches(
+                    source_conn,
+                    source_schema,
+                    table,
+                    self.batch_size
+                )
+            except Exception as e:
+                error_msg = f"Failed to initialize batch extraction for '{source_schema}.{table}': {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                table_stats["errors"].append(error_msg)
+                return False
+            
+            total_inserted = 0
+            batch_count = 0
+            
+            # Track if we processed any batches
+            processed_any_batches = False
+            
+            # Process each batch
+            for batch_df in batches:
+                processed_any_batches = True
+                batch_count += 1
+                
+                if batch_df.empty:
+                    logger.warning(f"Empty batch received for '{source_schema}.{table}', skipping")
+                    continue
+                
+                # Transform this batch
+                batch_transformed = transform_dataframe(batch_df, columns)
+                
+                # Force python native types to avoid np.float64 issues
+                for col in batch_transformed.columns:
+                    if batch_transformed[col].dtype.name.startswith('float'):
+                        # Explicitly convert numpy float types to Python float
+                        non_null = ~batch_transformed[col].isna()
+                        batch_transformed.loc[non_null, col] = batch_transformed.loc[non_null, col].apply(
+                            lambda x: float(x) if pd.notnull(x) else None
+                        )
+                    elif batch_transformed[col].dtype.name.startswith('int'):
+                        # Convert integers to float if they might be too large
+                        if batch_transformed[col].max() > 2147483647 or batch_transformed[col].min() < -2147483648:
+                            batch_transformed[col] = batch_transformed[col].astype(float)
+                        else:
+                            # Explicitly convert to Python int
+                            non_null = ~batch_transformed[col].isna()
+                            batch_transformed.loc[non_null, col] = batch_transformed.loc[non_null, col].apply(
+                                lambda x: int(x) if pd.notnull(x) else None
+                            )
+                    elif 'datetime' in batch_transformed[col].dtype.name or batch_transformed[col].dtype.name.startswith('datetime'):
+                        # Ensure datetime types are properly converted
+                        non_null = ~batch_transformed[col].isna()
+                        batch_transformed.loc[non_null, col] = batch_transformed.loc[non_null, col].apply(
+                            lambda x: x.to_pydatetime() if hasattr(x, 'to_pydatetime') else x
+                        )
+                    elif batch_transformed[col].dtype.name.startswith('bool'):
+                        # Explicitly convert to Python bool
+                        non_null = ~batch_transformed[col].isna()
+                        batch_transformed.loc[non_null, col] = batch_transformed.loc[non_null, col].apply(
+                            lambda x: bool(x) if pd.notnull(x) else None
+                        )
+                    elif hasattr(batch_transformed[col].dtype, 'type'):
+                        # Handle other numpy types by converting them to Python native types
+                        non_null = ~batch_transformed[col].isna()
+                        batch_transformed.loc[non_null, col] = batch_transformed.loc[non_null, col].apply(
+                            lambda x: x.item() if hasattr(x, 'item') else x
+                        )
+                
+                # Validate data types
+                validation_issues = validate_data_types(batch_transformed, columns)
+                if validation_issues:
+                    for column, issues in validation_issues.items():
+                        warning_msg = f"Data validation issues in batch {batch_count}, column '{column}': {', '.join(issues)}"
+                        logger.warning(warning_msg)
+                        table_stats["warnings"].append(warning_msg)
+                
+                # Insert this batch
+                rows_inserted, insert_success = insert_dataframe(
+                    target_conn,
+                    batch_transformed,
+                    target_schema,
+                    table,
+                    self.batch_size
+                )
+                
+                if not insert_success:
+                    error_msg = f"Failed to insert batch {batch_count} into '{target_schema}.{table}'. Reason: {rows_inserted} rows inserted."
+                    logger.error(error_msg)
+                    table_stats["errors"].append(error_msg)
+                    # Continue trying other batches rather than failing the whole table immediately
+                    if rows_inserted == 0:
+                        warning_msg = f"Batch {batch_count} had 0 rows inserted, will continue with next batch but table might be incomplete"
+                        logger.warning(warning_msg)
+                        table_stats["warnings"].append(warning_msg)
+                    else:
+                        # Some rows were inserted, so continue
+                        total_inserted += rows_inserted
+                        logger.info(f"Batch {batch_count} partially inserted {rows_inserted} rows. Total so far: {total_inserted}")
+                else:
+                    total_inserted += rows_inserted
+                    logger.info(f"Batch {batch_count} inserted {rows_inserted} rows. Total so far: {total_inserted}")
+            
+            # Check if we processed any batches at all
+            if not processed_any_batches:
+                error_msg = f"No batches were processed for '{source_schema}.{table}'. Extraction likely failed."
+                logger.error(error_msg)
+                table_stats["errors"].append(error_msg)
+                return False
+            
+            # Check if we managed to insert any rows
+            if total_inserted == 0:
+                error_msg = f"Failed to insert any rows into '{target_schema}.{table}' after processing {batch_count} batches."
+                logger.error(error_msg)
+                table_stats["errors"].append(error_msg)
+                return False
+            
+            # Get final row count from target
+            target_row_count = get_target_row_count(target_conn, target_schema, table)
+            table_stats["target_rows"] = target_row_count
+            
+            # Verify row count
+            verify_success, percentage = verify_row_count(
+                table_stats["source_rows"],
+                target_row_count,
+                target_schema,
+                table
+            )
+            
+            table_stats["row_verification"] = verify_success
+            table_stats["completion_percentage"] = percentage
+            
+            # Only report success if we actually transferred some data
+            if target_row_count == 0 and table_stats["source_rows"] > 0:
+                error_msg = f"Failed to transfer any data for '{source_schema}.{table}'. Source has {table_stats['source_rows']} rows but target has 0."
+                logger.error(error_msg)
+                table_stats["errors"].append(error_msg)
+                return False
+            
+            logger.info(f"Successfully processed large table '{source_schema}.{table}' in {batch_count} batches. Transferred {target_row_count}/{table_stats['source_rows']} rows ({percentage:.2f}%).")
+            return verify_success  # Return based on row count verification
+            
+        except Exception as e:
+            error_msg = f"Error processing large table '{source_schema}.{table}' in batches: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            table_stats["errors"].append(error_msg)
+            return False
     
     def run(self):
         """

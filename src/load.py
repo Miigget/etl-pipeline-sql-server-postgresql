@@ -14,6 +14,97 @@ from src.transform import convert_sql_server_to_postgres_type
 
 logger = logging.getLogger(__name__)
 
+def _is_numpy_type(value):
+    """
+    Safely determine if a value is a NumPy type without relying on deprecated type references.
+    
+    Args:
+        value: Any value to check
+    
+    Returns:
+        bool: True if value is a NumPy type, False otherwise
+    """
+    # Handle None values
+    if value is None:
+        return False
+        
+    # Check if it's from the numpy module
+    module_name = type(value).__module__
+    if module_name.startswith('numpy'):
+        return True
+    
+    # Check if it has numpy-specific attributes
+    if hasattr(value, 'dtype'):
+        return True
+        
+    return False
+
+def _convert_numpy_value_to_python(value):
+    """
+    Convert a NumPy value to its Python equivalent.
+    
+    Args:
+        value: NumPy value to convert
+    
+    Returns:
+        The equivalent Python value
+    """
+    if value is None:
+        return None
+        
+    # If it has an item method, use it (works for all numpy scalar types)
+    if hasattr(value, 'item') and callable(getattr(value, 'item')):
+        try:
+            return value.item()
+        except:
+            # In case item() fails
+            pass
+    
+    # Handle numpy arrays
+    if hasattr(value, 'tolist') and callable(getattr(value, 'tolist')):
+        return value.tolist()
+    
+    # Handle specific types based on the string representation of the type
+    type_str = str(type(value)).lower()
+    
+    if 'int' in type_str:
+        return int(value)
+    elif 'float' in type_str:
+        return float(value)
+    elif 'bool' in type_str:
+        return bool(value)
+    elif 'datetime' in type_str or 'timestamp' in type_str:
+        # Convert to pandas Timestamp then to Python datetime
+        return pd.Timestamp(value).to_pydatetime()
+    
+    # Try converting using dtype.name if available
+    if hasattr(value, 'dtype') and hasattr(value.dtype, 'name'):
+        dtype_name = value.dtype.name.lower()
+        
+        if 'int' in dtype_name:
+            return int(value)
+        elif 'float' in dtype_name:
+            return float(value)
+        elif 'bool' in dtype_name:
+            return bool(value)
+        elif 'datetime' in dtype_name:
+            return pd.Timestamp(value).to_pydatetime()
+            
+    # Last resort fallback
+    try:
+        # Try direct conversion
+        if hasattr(value, '__int__'):
+            return int(value)
+        elif hasattr(value, '__float__'):
+            return float(value)
+        elif hasattr(value, '__bool__'):
+            return bool(value)
+    except:
+        pass
+            
+    # Final string fallback
+    return str(value)
+
 def get_target_connection():
     """
     Create a connection to the target PostgreSQL database.
@@ -459,25 +550,24 @@ def insert_dataframe(
                 # Get the first non-null value to determine type
                 sample_val = df_clean.loc[non_null_mask, col].iloc[0]
                 
-                # Handle different numpy types
-                if isinstance(sample_val, np.integer):
-                    # Convert numpy integers to Python int
-                    df_clean.loc[non_null_mask, col] = df_clean.loc[non_null_mask, col].astype(int)
-                elif isinstance(sample_val, np.floating):
-                    # Convert numpy floats to Python float
-                    df_clean.loc[non_null_mask, col] = df_clean.loc[non_null_mask, col].astype(float)
-                elif isinstance(sample_val, np.bool_):
-                    # Convert numpy booleans to Python bool
-                    df_clean.loc[non_null_mask, col] = df_clean.loc[non_null_mask, col].astype(bool)
-                elif isinstance(sample_val, np.datetime64):
-                    # Convert numpy datetime64 to Python datetime
-                    df_clean.loc[non_null_mask, col] = pd.to_datetime(df_clean.loc[non_null_mask, col]).dt.to_pydatetime()
+                # Use our type detection function to safely handle NumPy types
+                if _is_numpy_type(sample_val):
+                    # Apply our conversion function to all non-null values
+                    df_clean.loc[non_null_mask, col] = df_clean.loc[non_null_mask, col].apply(
+                        lambda x: _convert_numpy_value_to_python(x)
+                    )
                 elif isinstance(sample_val, pd.Timestamp):
                     # Convert pandas Timestamp to Python datetime
-                    df_clean.loc[non_null_mask, col] = df_clean.loc[non_null_mask, col].apply(lambda x: x.to_pydatetime() if isinstance(x, pd.Timestamp) else x)
-                elif hasattr(sample_val, 'dtype') and pd.api.types.is_object_dtype(sample_val.dtype):
-                    # If it's a numpy object, convert to Python type
-                    df_clean.loc[non_null_mask, col] = df_clean.loc[non_null_mask, col].apply(lambda x: x.item() if hasattr(x, 'item') else x)
+                    df_clean.loc[non_null_mask, col] = df_clean.loc[non_null_mask, col].apply(
+                        lambda x: x.to_pydatetime() if isinstance(x, pd.Timestamp) else x
+                    )
+                
+                # Additional safety measure: Convert any remaining NumPy types
+                if pd.api.types.is_numeric_dtype(df_clean[col]):
+                    # Apply safe conversion to Python types
+                    df_clean.loc[non_null_mask, col] = df_clean.loc[non_null_mask, col].apply(
+                        lambda x: _convert_numpy_value_to_python(x) if _is_numpy_type(x) else x
+                    )
         
         # Replace NaN with None (which converts to SQL NULL)
         df_clean = df_clean.where(pd.notnull(df_clean), None)
@@ -502,6 +592,21 @@ def insert_dataframe(
         try:
             # Convert DataFrame to list of tuples
             tuples = [tuple(x) for x in df_clean.to_numpy()]
+            
+            # Ensure all values are Python native types by additional processing of NumPy values
+            processed_tuples = []
+            for row_tuple in tuples:
+                processed_row = []
+                for val in row_tuple:
+                    # Use the new helper functions for more robust NumPy type handling
+                    if _is_numpy_type(val):
+                        processed_row.append(_convert_numpy_value_to_python(val))
+                    else:
+                        processed_row.append(val)
+                processed_tuples.append(tuple(processed_row))
+            
+            # Use the processed tuples instead of the original
+            tuples = processed_tuples
             
             # Insert in batches
             for i in range(0, total_rows, batch_size):
@@ -529,7 +634,17 @@ def insert_dataframe(
                     
                     for row in batch:
                         try:
-                            cursor.execute(row_insert_query, row)
+                            # Ensure every value in the row is properly converted
+                            processed_row = []
+                            for val in row:
+                                # Use the new helper functions for more robust NumPy type handling
+                                if _is_numpy_type(val):
+                                    processed_row.append(_convert_numpy_value_to_python(val))
+                                else:
+                                    processed_row.append(val)
+                            
+                            # Use the processed row for the insertion
+                            cursor.execute(row_insert_query, tuple(processed_row))
                             connection.commit()
                             inserted_rows += 1
                         except Exception as row_error:
