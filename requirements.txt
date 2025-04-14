@@ -1,0 +1,12 @@
+pyodbc
+psycopg2
+pandas
+# Optional: SQLAlchemy for ORM functionality
+SQLAlchemy
+python-dotenv
+pytest
+ruff
+black
+pylint
+flake8
+mypy
