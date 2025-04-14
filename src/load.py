@@ -117,6 +117,7 @@ def get_target_connection():
     """
     try:
         connection_params = get_target_connection_params()
+        logger.info(f"Connection params: {connection_params}")
         logger.info("Connecting to target database")
         connection = psycopg2.connect(**connection_params)
         connection.autocommit = False

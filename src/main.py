@@ -20,6 +20,7 @@ from src.extract import (
     get_table_primary_keys,
     extract_table_data,
     extract_table_data_in_batches,
+    get_filtered_table_row_count,
 )
 from src.transform import (
     transform_dataframe,
@@ -44,7 +45,8 @@ class ETLPipeline:
     def __init__(self, source_schemas: List[str], target_schemas: Optional[List[str]] = None, 
                  tables: Optional[List[str]] = None, batch_size: int = 10000,
                  drop_tables: bool = False, truncate_tables: bool = True,
-                 disable_foreign_keys: bool = True, max_retries: int = 3):
+                 disable_foreign_keys: bool = True, max_retries: int = 3,
+                 where_clauses: Optional[Dict[str, str]] = None):
         """
         Initialize the ETL Pipeline.
         
@@ -57,6 +59,7 @@ class ETLPipeline:
             truncate_tables: bool - Whether to truncate tables before inserting
             disable_foreign_keys: bool - Whether to disable foreign key constraints during migration (default True)
             max_retries: int - Maximum number of retries for tables with foreign key constraint failures
+            where_clauses: Optional[Dict[str, str]] - Dictionary mapping table names (schema.table) to WHERE clauses
         """
         self.source_schemas = source_schemas
         self.target_schemas = target_schemas if target_schemas else source_schemas
@@ -66,6 +69,7 @@ class ETLPipeline:
         self.truncate_tables = truncate_tables
         self.disable_foreign_keys = disable_foreign_keys
         self.max_retries = max_retries
+        self.where_clauses = where_clauses or {}
         
         # Tracking processed tables
         self.processed_tables = set()
@@ -207,16 +211,39 @@ class ETLPipeline:
                     logger.warning(warning_msg)
                     table_stats["warnings"].append(warning_msg)
             
+            # Get WHERE clause for this table if specified
+            where_clause = self.where_clauses.get(table_key)
+            if where_clause:
+                logger.info(f"Using WHERE clause for '{table_key}': {where_clause}")
+                table_stats["where_clause"] = where_clause
+                
+                # Get filtered row count (only rows matching WHERE clause)
+                filtered_row_count = get_filtered_table_row_count(
+                    source_conn, 
+                    source_schema, 
+                    table, 
+                    where_clause
+                )
+                logger.info(f"Filtered row count for '{table_key}': {filtered_row_count} rows")
+                # Store the filtered count for verification
+                table_stats["source_rows_filtered"] = filtered_row_count
+            
             # Extract data from source
             df, source_row_count = extract_table_data(
                 source_conn, 
                 source_schema, 
                 table, 
-                self.batch_size
+                self.batch_size,
+                where_clause
             )
             
-            # Update source row count
-            table_stats["source_rows"] = source_row_count
+            # Update source row count - use filtered count if available
+            if where_clause and "source_rows_filtered" in table_stats:
+                # For WHERE clause filtered tables, we use the filtered count as source
+                table_stats["source_rows"] = table_stats["source_rows_filtered"]
+                logger.info(f"Using filtered row count ({table_stats['source_rows_filtered']}) for verification instead of total table size ({source_row_count})")
+            else:
+                table_stats["source_rows"] = source_row_count
             
             if df.empty and source_row_count > 0:
                 # This indicates a large table that needs batch processing
@@ -341,6 +368,21 @@ class ETLPipeline:
                 
                 table_stats["row_verification"] = verify_success
                 table_stats["completion_percentage"] = percentage
+                
+                # Calculate whether the transfer was successful based on filtered counts when needed
+                if where_clause:
+                    # When filtering is used, we care about whether the number of transferred rows matches the filtered count
+                    success = target_row_count == table_stats["source_rows"]  # Require exact match (100%)
+                    logger.info(f"Row verification with WHERE filter: {target_row_count}/{table_stats['source_rows']} rows ({percentage:.2f}%). Success: {success}")
+                    
+                    # Update row verification result based on filtered comparison
+                    table_stats["row_verification"] = success
+                    
+                    if not success:
+                        # Not an exact match - add a warning
+                        warning_msg = f"Row count mismatch: {target_row_count}/{table_stats['source_rows']} rows ({percentage:.2f}%)"
+                        logger.warning(warning_msg)
+                        table_stats["warnings"].append(warning_msg)
             else:
                 # Empty source table
                 logger.info(f"Table '{source_schema}.{table}' is empty, no data to transfer")
@@ -348,8 +390,8 @@ class ETLPipeline:
                 table_stats["row_verification"] = True
                 table_stats["completion_percentage"] = 100.0
             
-            # Mark table as processed and successful
-            table_stats["success"] = True if not table_stats["errors"] else False
+            # Mark table as processed and successful - base success on row_verification field
+            table_stats["success"] = True if table_stats["row_verification"] and not table_stats["errors"] else False
             self.processed_tables.add(table_key)
             
             # Update end time and duration
@@ -404,13 +446,37 @@ class ETLPipeline:
                 table_stats["errors"].append(error_msg)
                 return False
             
+            # Get WHERE clause for this table if specified
+            table_key = f"{source_schema}.{table}"
+            where_clause = self.where_clauses.get(table_key)
+            if where_clause:
+                logger.info(f"Using WHERE clause for batch processing of '{table_key}': {where_clause}")
+                # Add WHERE clause to table_stats for reporting
+                table_stats["where_clause"] = where_clause
+                
+                # Get filtered row count (only rows matching WHERE clause)
+                if "source_rows_filtered" not in table_stats:
+                    filtered_row_count = get_filtered_table_row_count(
+                        source_conn, 
+                        source_schema, 
+                        table, 
+                        where_clause
+                    )
+                    logger.info(f"Filtered row count for '{table_key}': {filtered_row_count} rows")
+                    # Store the filtered count for verification
+                    table_stats["source_rows_filtered"] = filtered_row_count
+                    # Update the source row count to use filtered count
+                    table_stats["source_rows"] = filtered_row_count
+                    logger.info(f"Using filtered row count ({filtered_row_count}) for verification instead of total table size ({table_stats['source_rows']})")
+            
             # Get batches iterator
             try:
                 batches = extract_table_data_in_batches(
                     source_conn,
                     source_schema,
                     table,
-                    self.batch_size
+                    self.batch_size,
+                    where_clause
                 )
             except Exception as e:
                 error_msg = f"Failed to initialize batch extraction for '{source_schema}.{table}': {str(e)}"
@@ -543,8 +609,24 @@ class ETLPipeline:
                 table_stats["errors"].append(error_msg)
                 return False
             
-            logger.info(f"Successfully processed large table '{source_schema}.{table}' in {batch_count} batches. Transferred {target_row_count}/{table_stats['source_rows']} rows ({percentage:.2f}%).")
-            return verify_success  # Return based on row count verification
+            # Calculate whether the transfer was successful based on filtered counts when needed
+            if where_clause:
+                # When filtering is used, we care about whether the number of transferred rows matches the filtered count
+                success = target_row_count == table_stats["source_rows"]  # Require exact match (100%)
+                logger.info(f"Row verification with WHERE filter: {target_row_count}/{table_stats['source_rows']} rows ({percentage:.2f}%). Success: {success}")
+                
+                if not success:
+                    # Not an exact match - add a warning
+                    warning_msg = f"Row count mismatch: {target_row_count}/{table_stats['source_rows']} rows ({percentage:.2f}%)"
+                    logger.warning(warning_msg)
+                    table_stats["warnings"].append(warning_msg)
+                    
+                logger.info(f"Successfully processed large table '{source_schema}.{table}' in {batch_count} batches. Transferred {target_row_count}/{table_stats['source_rows']} rows ({percentage:.2f}%).")
+                return success
+            else:
+                # Standard behavior for non-filtered tables
+                logger.info(f"Successfully processed large table '{source_schema}.{table}' in {batch_count} batches. Transferred {target_row_count}/{table_stats['source_rows']} rows ({percentage:.2f}%).")
+                return verify_success  # Return based on row count verification
             
         except Exception as e:
             error_msg = f"Error processing large table '{source_schema}.{table}' in batches: {str(e)}"
@@ -929,6 +1011,13 @@ def parse_args():
         help="Path to the report file (default: migration_report.json)"
     )
     
+    parser.add_argument(
+        "--where-clause",
+        type=str,
+        nargs="+",
+        help="Specify WHERE clauses for specific tables. Format: 'schema.table:condition'"
+    )
+    
     return parser.parse_args()
 
 
@@ -939,6 +1028,20 @@ def main():
     # Parse command line arguments
     args = parse_args()
     
+    # Process where clauses if provided
+    where_clauses = {}
+    if args.where_clause:
+        for clause in args.where_clause:
+            # Split the argument by first colon to get table and condition
+            parts = clause.split(':', 1)
+            if len(parts) != 2:
+                logger.error(f"Invalid where clause format: {clause}. Format should be 'schema.table:condition'")
+                continue
+                
+            table_key, condition = parts
+            where_clauses[table_key] = condition
+            logger.info(f"Added WHERE clause for table '{table_key}': {condition}")
+    
     # Create and run ETL pipeline
     etl = ETLPipeline(
         source_schemas=args.source_schemas,
@@ -948,7 +1051,8 @@ def main():
         drop_tables=args.drop_tables,
         truncate_tables=not args.no_truncate,
         disable_foreign_keys=args.disable_foreign_keys,
-        max_retries=args.max_retries
+        max_retries=args.max_retries,
+        where_clauses=where_clauses
     )
     
     etl.run()

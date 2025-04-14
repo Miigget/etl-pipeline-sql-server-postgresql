@@ -192,6 +192,37 @@ def get_table_row_count(connection: pyodbc.Connection, schema: str, table: str) 
         logger.error(f"Failed to retrieve row count for table '{schema}.{table}': {str(e)}")
         return 0
 
+def get_filtered_table_row_count(connection: pyodbc.Connection, schema: str, table: str, where_clause: Optional[str] = None) -> int:
+    """
+    Get the number of rows in a specific table that match the given WHERE clause.
+    
+    Args:
+        connection: pyodbc.Connection - Connection to the source database
+        schema: str - Schema name
+        table: str - Table name
+        where_clause: Optional[str] - WHERE clause to filter rows
+        
+    Returns:
+        int: Number of rows in the table that match the WHERE clause
+    """
+    if not schema or not table:
+        logger.error("Schema and table names are required")
+        return 0
+    
+    try:
+        cursor = connection.cursor()
+        query = f"SELECT COUNT(*) FROM [{schema}].[{table}]"
+        if where_clause:
+            query += f" WHERE {where_clause}"
+        
+        cursor.execute(query)
+        row_count = cursor.fetchone()[0]
+        logger.info(f"Table '{schema}.{table}' has {row_count} rows matching WHERE condition")
+        return row_count
+    except Exception as e:
+        logger.error(f"Failed to retrieve filtered row count for table '{schema}.{table}': {str(e)}")
+        return 0
+
 def extract_table_data(
     connection: pyodbc.Connection, 
     schema: str, 

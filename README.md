@@ -75,6 +75,18 @@ Configure batch size for large datasets:
 python -m src.main --source-schemas data --batch-size 5000
 ```
 
+Filter data from specific tables using WHERE clauses:
+
+```bash
+python -m src.main --source-schemas data --where-clause "data.historical_data_entries:device_variable_id in (select dv.id from conf.device_variables dv join conf.devices d on d.id = dv.device_id where d.project_id = '4FAC9668-0DE0-42CA-8645-58F3DAFB2151')"
+```
+
+You can specify multiple WHERE clauses for different tables:
+
+```bash
+python -m src.main --source-schemas data conf --where-clause "data.table1:created_at > '2023-01-01'" "conf.table2:is_active = 1"
+```
+
 Drop and recreate tables (caution: destroys existing data):
 
 ```bash
@@ -104,6 +116,35 @@ Specify a custom report file location:
 ```bash
 python -m src.main --source-schemas conf --report-file /path/to/migration_report.json
 ```
+
+### Data Filtering
+
+The ETL pipeline supports filtering data from source tables using WHERE clauses. This is useful when you only need to migrate a subset of data from large tables.
+
+To filter data, use the `--where-clause` option followed by one or more filter specifications in the format `schema.table:condition`:
+
+```bash
+python -m src.main --source-schemas data --where-clause "data.historical_data_entries:created_at > '2023-01-01'"
+```
+
+The condition is appended to the SQL query as a WHERE clause, so it should use valid SQL syntax for the source database. For complex conditions, you can use subqueries:
+
+```bash
+python -m src.main --source-schemas data --where-clause "data.historical_data_entries:device_variable_id in (select id from conf.device_variables where type = 'temperature')"
+```
+
+Multiple filters can be applied by specifying multiple `--where-clause` arguments:
+
+```bash
+python -m src.main --source-schemas data conf --where-clause "data.table1:status = 'active'" "conf.table2:created_by = 'admin'"
+```
+
+Note that filtering affects both row count verification and performance:
+- Only filtered rows are counted in source row counts
+- For large tables, filtering can significantly improve performance by reducing the amount of data transferred
+- The success verification automatically uses the filtered row count (rather than the total table size) to determine if the transfer was successful
+
+When using filters, the transfer is considered successful only if exactly 100% of the filtered rows were transferred. This ensures complete data integrity for the specific data subset defined by the WHERE clause.
 
 ## Testing
 
@@ -183,4 +224,4 @@ If you encounter problems with foreign key constraints during the migration proc
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. 
+Contributions are welcome! Please feel free to submit a Pull Request.
